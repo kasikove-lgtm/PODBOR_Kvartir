@@ -3,6 +3,7 @@ import base64
 import json
 import logging
 import os
+import shelve
 from datetime import datetime, timezone, timedelta as td
 
 import gspread
@@ -21,6 +22,12 @@ ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 SHEET_ID = os.environ["SHEET_ID"]
 SHEET_NAME = os.environ.get("SHEET_NAME", "Объявления")
 GOOGLE_CREDS_JSON = os.environ["GOOGLE_CREDS_JSON"]
+
+# Папка для persistent-данных — на bothost туда монтируется постоянный volume,
+# чтобы текущие сессии (незавершённые квартиры) переживали перезапуск бота.
+DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
+os.makedirs(DATA_DIR, exist_ok=True)
+SESSIONS_DB_PATH = os.path.join(DATA_DIR, "avito_bot_sessions")
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
@@ -274,19 +281,42 @@ def confirm_kb(uid: int):
     )
 
 
-# sessions[user_id] = {"fields": {...накопленные поля...}, "link": "..." или None}
-# Одна сессия = одна квартира. Все скрины и ссылка, присланные подряд этим пользователем,
-# копятся в одну сессию, пока он не нажмёт "Готово" или "Отмена".
-sessions: dict[int, dict] = {}
+# Все незавершённые сессии (квартиры в процессе сбора данных) хранятся в shelve-файле
+# на диске, а не просто в памяти процесса — иначе перезапуск бота на bothost обрушивает
+# текущую работу (показанная карточка остаётся, а данные за ней пропадают).
+# Ключи в shelve — строки (shelve этого требует), поэтому uid переводим в str.
 
-# awaiting_edit — кто сейчас прислал "Исправить" и должен прислать поправленный текст следующим сообщением.
-awaiting_edit: set[int] = set()
+
+def _load_session(uid: int) -> dict:
+    with shelve.open(SESSIONS_DB_PATH) as db:
+        key = str(uid)
+        if key not in db:
+            db[key] = {"fields": {}, "link": None, "awaiting_edit": False}
+        return db[key]
+
+
+def _save_session(uid: int, session: dict) -> None:
+    with shelve.open(SESSIONS_DB_PATH) as db:
+        db[str(uid)] = session
+
+
+def _drop_session(uid: int) -> None:
+    with shelve.open(SESSIONS_DB_PATH) as db:
+        db.pop(str(uid), None)
 
 
 def get_session(uid: int) -> dict:
-    if uid not in sessions:
-        sessions[uid] = {"fields": {}, "link": None}
-    return sessions[uid]
+    return _load_session(uid)
+
+
+def set_awaiting_edit(uid: int, value: bool) -> None:
+    session = _load_session(uid)
+    session["awaiting_edit"] = value
+    _save_session(uid, session)
+
+
+def is_awaiting_edit(uid: int) -> bool:
+    return _load_session(uid).get("awaiting_edit", False)
 
 
 def merge_fields(session: dict, new_fields: dict) -> None:
@@ -329,6 +359,7 @@ async def handle_photo(message: Message):
 
     session = get_session(uid)
     merge_fields(session, new_fields)
+    _save_session(uid, session)
     await status.delete()
     await message.answer(format_session(session), reply_markup=confirm_kb(uid))
 
@@ -339,8 +370,7 @@ async def apt_drop(cb: CallbackQuery):
     if cb.from_user.id != uid:
         await cb.answer("Это не твоя карточка", show_alert=True)
         return
-    sessions.pop(uid, None)
-    awaiting_edit.discard(uid)
+    _drop_session(uid)
     await cb.message.edit_text("Отменено. Можешь начать новую квартиру — пришли скрин.")
     await cb.answer()
 
@@ -352,17 +382,18 @@ async def apt_edit(cb: CallbackQuery):
         await cb.answer("Это не твоя карточка", show_alert=True)
         return
 
-    session = sessions.get(uid)
-    if not session:
+    session = get_session(uid)
+    if not session["fields"] and not session.get("link"):
         await cb.answer("Нет данных для правки, пришли скрин заново", show_alert=True)
         return
 
-    awaiting_edit.add(uid)
+    set_awaiting_edit(uid, True)
     await cb.answer()
     await cb.message.answer(
-        "Скопируй текст ниже, поправь нужные строки и пришли обратно целиком:\n\n"
-        + format_session_plain(session)
+        "Скопируй сообщение ниже целиком (долгий тап → Копировать), "
+        "поправь нужные строки и пришли обратно."
     )
+    await cb.message.answer(format_session_plain(session))
 
 
 @dp.callback_query(F.data.startswith("apt_done_"))
@@ -372,8 +403,8 @@ async def apt_done(cb: CallbackQuery):
         await cb.answer("Это не твоя карточка", show_alert=True)
         return
 
-    session = sessions.get(uid)
-    if not session or not session["fields"]:
+    session = get_session(uid)
+    if not session["fields"]:
         await cb.answer("Нет данных для записи, пришли скрин заново", show_alert=True)
         return
 
@@ -396,8 +427,7 @@ async def apt_done(cb: CallbackQuery):
         await cb.message.edit_text(f"Не получилось записать в таблицу: {e}")
         return
 
-    sessions.pop(uid, None)
-    awaiting_edit.discard(uid)
+    _drop_session(uid)
     await cb.message.edit_text(
         cb.message.html_text + "\n\n✅ <b>Квартира записана в таблицу одной строкой.</b>"
     )
@@ -411,13 +441,14 @@ async def handle_text(message: Message):
     if text.startswith("/"):
         return
 
-    if uid in awaiting_edit:
-        awaiting_edit.discard(uid)
+    if is_awaiting_edit(uid):
+        set_awaiting_edit(uid, False)
         parsed = parse_plain_session(text)
         session = get_session(uid)
         session["fields"].update(parsed["fields"])
         if parsed["link"] is not None:
             session["link"] = parsed["link"]
+        _save_session(uid, session)
         await message.answer(format_session(session), reply_markup=confirm_kb(uid))
         return
 
@@ -430,6 +461,7 @@ async def handle_text(message: Message):
 
     session = get_session(uid)
     session["link"] = text
+    _save_session(uid, session)
     await message.answer(format_session(session), reply_markup=confirm_kb(uid))
 
 
