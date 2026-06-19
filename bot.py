@@ -140,21 +140,32 @@ def format_preview(fields: dict) -> str:
     return "\n".join(lines)
 
 
-def confirm_kb():
+def confirm_kb(card_id: int):
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="✅ Записать", callback_data="apt_confirm"),
-                InlineKeyboardButton(text="❌ Отмена", callback_data="apt_cancel"),
+                InlineKeyboardButton(text="✅ Записать", callback_data=f"apt_confirm_{card_id}"),
+                InlineKeyboardButton(text="❌ Отмена", callback_data=f"apt_cancel_{card_id}"),
             ]
         ]
     )
 
 
-# pending[user_id] = dict с полями, ожидающими подтверждения
+# pending[card_id] = dict с полями, ожидающими подтверждения
+# card_id уникален для каждого скрина — так параллельные скрины не перетирают друг друга
 pending: dict[int, dict] = {}
-# last_row[user_id] = номер последней записанной строки (для дозаписи ссылки)
-last_row: dict[int, int] = {}
+_card_counter = 0
+
+
+def next_card_id() -> int:
+    global _card_counter
+    _card_counter += 1
+    return _card_counter
+
+
+# rows_waiting_for_link[user_id] = список номеров строк, записанных в таблицу,
+# но ещё без ссылки (в порядке добавления — старые первыми)
+rows_waiting_for_link: dict[int, list[int]] = {}
 
 
 @dp.message(CommandStart())
@@ -168,7 +179,6 @@ async def start(message: Message):
 
 @dp.message(F.photo)
 async def handle_photo(message: Message):
-    uid = message.from_user.id
     status = await message.answer("Распознаю скрин...")
     try:
         photo = message.photo[-1]
@@ -180,23 +190,25 @@ async def handle_photo(message: Message):
         await status.edit_text(f"Не получилось распознать скрин: {e}")
         return
 
-    pending[uid] = fields
+    card_id = next_card_id()
+    pending[card_id] = fields
     await status.delete()
-    await message.answer(format_preview(fields), reply_markup=confirm_kb())
+    await message.answer(format_preview(fields), reply_markup=confirm_kb(card_id))
 
 
-@dp.callback_query(F.data == "apt_cancel")
+@dp.callback_query(F.data.startswith("apt_cancel_"))
 async def apt_cancel(cb: CallbackQuery):
-    uid = cb.from_user.id
-    pending.pop(uid, None)
+    card_id = int(cb.data[len("apt_cancel_"):])
+    pending.pop(card_id, None)
     await cb.message.edit_text("Отменено. Можешь прислать новый скрин.")
     await cb.answer()
 
 
-@dp.callback_query(F.data == "apt_confirm")
+@dp.callback_query(F.data.startswith("apt_confirm_"))
 async def apt_confirm(cb: CallbackQuery):
+    card_id = int(cb.data[len("apt_confirm_"):])
     uid = cb.from_user.id
-    fields = pending.get(uid)
+    fields = pending.get(card_id)
     if not fields:
         await cb.answer("Данные устарели, пришли скрин заново", show_alert=True)
         return
@@ -225,13 +237,13 @@ async def apt_confirm(cb: CallbackQuery):
         ]
         ws.append_row(row, value_input_option="USER_ENTERED")
         row_count = len(ws.get_all_values())
-        last_row[uid] = row_count
+        rows_waiting_for_link.setdefault(uid, []).append(row_count)
     except Exception as e:
         log.exception("Ошибка записи в таблицу")
         await cb.message.edit_text(f"Не получилось записать в таблицу: {e}")
         return
 
-    pending.pop(uid, None)
+    pending.pop(card_id, None)
     await cb.message.edit_text(
         cb.message.html_text + "\n\n✅ <b>Записано в таблицу.</b>\nПришли ссылку на объявление отдельным сообщением."
     )
@@ -252,10 +264,12 @@ async def handle_text(message: Message):
         )
         return
 
-    row_idx = last_row.get(uid)
-    if not row_idx:
-        await message.answer("Не вижу последней записанной строки. Сначала пришли скрин и подтверди запись.")
+    queue = rows_waiting_for_link.get(uid) or []
+    if not queue:
+        await message.answer("Не вижу записанных строк без ссылки. Сначала пришли скрин и подтверди запись.")
         return
+
+    row_idx = queue.pop(0)  # самая старая ожидающая строка
 
     try:
         ws = get_sheet()
@@ -266,7 +280,6 @@ async def handle_text(message: Message):
         return
 
     await message.answer("Ссылка добавлена в таблицу ✅")
-    last_row.pop(uid, None)
 
 
 async def main():
