@@ -167,86 +167,104 @@ async def extract_from_image(image_bytes: bytes) -> dict:
     return json.loads(raw)
 
 
-def format_preview(fields: dict) -> str:
-    lines = ["<b>Распознал со скрина:</b>\n"]
+def format_session(session: dict) -> str:
+    lines = ["<b>Накоплено по квартире:</b>\n"]
     for key, label in FIELDS:
-        val = fields.get(key, "") or "—"
+        val = session["fields"].get(key, "") or "—"
         lines.append(f"<b>{label}:</b> {val}")
-    lines.append("\n<i>Проверь и подтверди</i>")
+    link = session.get("link") or "—"
+    lines.append(f"<b>Ссылка:</b> {link}")
+    lines.append("\n<i>Шли ещё скрины/ссылку или жми «Готово»</i>")
     return "\n".join(lines)
 
 
-def confirm_kb(card_id: int):
+def confirm_kb(uid: int):
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="✅ Записать", callback_data=f"apt_confirm_{card_id}"),
-                InlineKeyboardButton(text="❌ Отмена", callback_data=f"apt_cancel_{card_id}"),
+                InlineKeyboardButton(text="✅ Готово, записать", callback_data=f"apt_done_{uid}"),
+                InlineKeyboardButton(text="❌ Отмена", callback_data=f"apt_drop_{uid}"),
             ]
         ]
     )
 
 
-# pending[card_id] = dict с полями, ожидающими подтверждения
-# card_id уникален для каждого скрина — так параллельные скрины не перетирают друг друга
-pending: dict[int, dict] = {}
-_card_counter = 0
+# sessions[user_id] = {"fields": {...накопленные поля...}, "link": "..." или None}
+# Одна сессия = одна квартира. Все скрины и ссылка, присланные подряд этим пользователем,
+# копятся в одну сессию, пока он не нажмёт "Готово" или "Отмена".
+sessions: dict[int, dict] = {}
 
 
-def next_card_id() -> int:
-    global _card_counter
-    _card_counter += 1
-    return _card_counter
+def get_session(uid: int) -> dict:
+    if uid not in sessions:
+        sessions[uid] = {"fields": {}, "link": None}
+    return sessions[uid]
 
 
-# rows_waiting_for_link[user_id] = список номеров строк, записанных в таблицу,
-# но ещё без ссылки (в порядке добавления — старые первыми)
-rows_waiting_for_link: dict[int, list[int]] = {}
+def merge_fields(session: dict, new_fields: dict) -> None:
+    """Докладывает новые распознанные поля в сессию.
+    Не перетирает уже заполненное непустое значение — новое значение
+    добавляется только в пустые поля."""
+    for key, _ in FIELDS:
+        new_val = (new_fields.get(key) or "").strip()
+        if not new_val:
+            continue
+        if not session["fields"].get(key):
+            session["fields"][key] = new_val
 
 
 @dp.message(CommandStart())
 async def start(message: Message):
     await message.answer(
-        "Привет! Пришли скрин объявления с Avito — распознаю данные и покажу для проверки.\n\n"
-        "После подтверждения и записи в таблицу пришли ссылку на объявление отдельным сообщением — "
-        "впишу её в ту же строку."
+        "Привет! Подбираем квартиру по объявлению с Avito.\n\n"
+        "Пришли один или несколько скринов объявления (и/или ссылку на него) — в любом порядке. "
+        "Я распознаю данные и буду показывать, что уже накопилось.\n\n"
+        "Когда все скрины и ссылка отправлены — жми «✅ Готово, записать» под последним сообщением. "
+        "Это запишет одну строку в таблицу."
     )
 
 
 @dp.message(F.photo)
 async def handle_photo(message: Message):
+    uid = message.from_user.id
     status = await message.answer("Распознаю скрин...")
     try:
         photo = message.photo[-1]
         file = await bot.get_file(photo.file_id)
         file_bytes = await bot.download_file(file.file_path)
-        fields = await extract_from_image(file_bytes.read())
+        new_fields = await extract_from_image(file_bytes.read())
     except Exception as e:
         log.exception("Ошибка распознавания")
         await status.edit_text(f"Не получилось распознать скрин: {e}")
         return
 
-    card_id = next_card_id()
-    pending[card_id] = fields
+    session = get_session(uid)
+    merge_fields(session, new_fields)
     await status.delete()
-    await message.answer(format_preview(fields), reply_markup=confirm_kb(card_id))
+    await message.answer(format_session(session), reply_markup=confirm_kb(uid))
 
 
-@dp.callback_query(F.data.startswith("apt_cancel_"))
-async def apt_cancel(cb: CallbackQuery):
-    card_id = int(cb.data[len("apt_cancel_"):])
-    pending.pop(card_id, None)
-    await cb.message.edit_text("Отменено. Можешь прислать новый скрин.")
+@dp.callback_query(F.data.startswith("apt_drop_"))
+async def apt_drop(cb: CallbackQuery):
+    uid = int(cb.data[len("apt_drop_"):])
+    if cb.from_user.id != uid:
+        await cb.answer("Это не твоя карточка", show_alert=True)
+        return
+    sessions.pop(uid, None)
+    await cb.message.edit_text("Отменено. Можешь начать новую квартиру — пришли скрин.")
     await cb.answer()
 
 
-@dp.callback_query(F.data.startswith("apt_confirm_"))
-async def apt_confirm(cb: CallbackQuery):
-    card_id = int(cb.data[len("apt_confirm_"):])
-    uid = cb.from_user.id
-    fields = pending.get(card_id)
-    if not fields:
-        await cb.answer("Данные устарели, пришли скрин заново", show_alert=True)
+@dp.callback_query(F.data.startswith("apt_done_"))
+async def apt_done(cb: CallbackQuery):
+    uid = int(cb.data[len("apt_done_"):])
+    if cb.from_user.id != uid:
+        await cb.answer("Это не твоя карточка", show_alert=True)
+        return
+
+    session = sessions.get(uid)
+    if not session or not session["fields"]:
+        await cb.answer("Нет данных для записи, пришли скрин заново", show_alert=True)
         return
 
     await cb.answer("Записываю...")
@@ -256,20 +274,21 @@ async def apt_confirm(cb: CallbackQuery):
 
         updates = [{"range": f"{DATE_COL}{row_idx}", "values": [[today_msk_str()]]}]
         for key, col in COLUMN_MAP.items():
-            val = fields.get(key, "")
+            val = session["fields"].get(key, "")
             if val:
                 updates.append({"range": f"{col}{row_idx}", "values": [[val]]})
+        if session.get("link"):
+            updates.append({"range": f"{LINK_COL}{row_idx}", "values": [[session["link"]]]})
 
         ws.batch_update(updates, value_input_option="USER_ENTERED")
-        rows_waiting_for_link.setdefault(uid, []).append(row_idx)
     except Exception as e:
         log.exception("Ошибка записи в таблицу")
         await cb.message.edit_text(f"Не получилось записать в таблицу: {e}")
         return
 
-    pending.pop(card_id, None)
+    sessions.pop(uid, None)
     await cb.message.edit_text(
-        cb.message.html_text + "\n\n✅ <b>Записано в таблицу.</b>\nПришли ссылку на объявление отдельным сообщением."
+        cb.message.html_text + "\n\n✅ <b>Квартира записана в таблицу одной строкой.</b>"
     )
 
 
@@ -288,22 +307,9 @@ async def handle_text(message: Message):
         )
         return
 
-    queue = rows_waiting_for_link.get(uid) or []
-    if not queue:
-        await message.answer("Не вижу записанных строк без ссылки. Сначала пришли скрин и подтверди запись.")
-        return
-
-    row_idx = queue.pop(0)  # самая старая ожидающая строка
-
-    try:
-        ws = get_sheet()
-        ws.update(f"{LINK_COL}{row_idx}", [[text]], value_input_option="USER_ENTERED")
-    except Exception as e:
-        log.exception("Ошибка записи ссылки")
-        await message.answer(f"Не получилось вписать ссылку: {e}")
-        return
-
-    await message.answer("Ссылка добавлена в таблицу ✅")
+    session = get_session(uid)
+    session["link"] = text
+    await message.answer(format_session(session), reply_markup=confirm_kb(uid))
 
 
 async def main():
