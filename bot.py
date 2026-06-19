@@ -44,6 +44,42 @@ def get_sheet():
     return sh.worksheet(SHEET_NAME)
 
 
+# Колонка B = "дата занесения в таблицу" — по ней определяем первую свободную строку.
+DATE_COL = "B"
+LINK_COL = "G"
+
+# Соответствие полей бота реальным буквам колонок таблицы "Объявления".
+# Колонки C, D, E, F, O бот не трогает — туда Евгений вписывает даты звонков/осмотров
+# и параметры дома вручную.
+COLUMN_MAP = {
+    "address": "H",
+    "condition": "I",
+    "agent_phone": "J",
+    "year": "K",
+    "material": "L",
+    "elevator": "M",
+    "comment": "N",
+    "rooms": "P",
+    "floor": "Q",
+    "price": "R",
+    "area_total": "S",
+    "area_living": "T",
+    "area_kitchen": "U",
+    "balcony": "V",
+    "stove": "W",
+}
+
+
+def find_first_empty_row(ws) -> int:
+    """Первая строка, где колонка B (дата занесения) пустая, начиная со строки 3
+    (строки 1-2 — заголовки/легенда)."""
+    col_values = ws.col_values(gspread.utils.a1_to_rowcol(f"{DATE_COL}1")[1])
+    row = 3
+    while row <= len(col_values) and col_values[row - 1].strip():
+        row += 1
+    return row
+
+
 FIELDS = [
     ("address", "Адрес"),
     ("condition", "Состояние квартиры"),
@@ -216,28 +252,16 @@ async def apt_confirm(cb: CallbackQuery):
     await cb.answer("Записываю...")
     try:
         ws = get_sheet()
-        row = [
-            today_msk_str(),  # дата
-            "",  # ссылка (заполнится отдельным сообщением)
-            fields.get("address", ""),
-            fields.get("condition", ""),
-            fields.get("agent_phone", ""),
-            fields.get("year", ""),
-            fields.get("material", ""),
-            fields.get("elevator", ""),
-            fields.get("comment", ""),
-            fields.get("rooms", ""),
-            fields.get("floor", ""),
-            fields.get("price", ""),
-            fields.get("area_total", ""),
-            fields.get("area_living", ""),
-            fields.get("area_kitchen", ""),
-            fields.get("balcony", ""),
-            fields.get("stove", ""),
-        ]
-        ws.append_row(row, value_input_option="USER_ENTERED")
-        row_count = len(ws.get_all_values())
-        rows_waiting_for_link.setdefault(uid, []).append(row_count)
+        row_idx = find_first_empty_row(ws)
+
+        updates = [{"range": f"{DATE_COL}{row_idx}", "values": [[today_msk_str()]]}]
+        for key, col in COLUMN_MAP.items():
+            val = fields.get(key, "")
+            if val:
+                updates.append({"range": f"{col}{row_idx}", "values": [[val]]})
+
+        ws.batch_update(updates, value_input_option="USER_ENTERED")
+        rows_waiting_for_link.setdefault(uid, []).append(row_idx)
     except Exception as e:
         log.exception("Ошибка записи в таблицу")
         await cb.message.edit_text(f"Не получилось записать в таблицу: {e}")
@@ -273,7 +297,7 @@ async def handle_text(message: Message):
 
     try:
         ws = get_sheet()
-        ws.update_cell(row_idx, 2, text)  # колонка 2 = ссылка
+        ws.update(f"{LINK_COL}{row_idx}", [[text]], value_input_option="USER_ENTERED")
     except Exception as e:
         log.exception("Ошибка записи ссылки")
         await message.answer(f"Не получилось вписать ссылку: {e}")
