@@ -226,13 +226,50 @@ def format_session(session: dict) -> str:
     return "\n".join(lines)
 
 
+def format_session_plain(session: dict) -> str:
+    """Версия без HTML-разметки — для копирования и правки руками.
+    Формат строки 'Подпись: значение' должен совпадать с тем, что разбирает parse_plain_session."""
+    lines = []
+    for key, label in FIELDS:
+        val = session["fields"].get(key, "") or ""
+        lines.append(f"{label}: {val}")
+    lines.append(f"Ссылка: {session.get('link') or ''}")
+    return "\n".join(lines)
+
+
+LABEL_TO_KEY = {label: key for key, label in FIELDS}
+
+
+def parse_plain_session(text: str) -> dict:
+    """Разбирает текст вида 'Подпись: значение' обратно в {"fields": {...}, "link": ...}.
+    Строки без узнаваемой подписи или с пустым значением игнорируются."""
+    new_fields: dict[str, str] = {}
+    new_link = None
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        label, _, value = line.partition(":")
+        label = label.strip()
+        value = value.strip()
+        if not value:
+            continue
+        if label == "Ссылка":
+            new_link = value
+        elif label in LABEL_TO_KEY:
+            new_fields[LABEL_TO_KEY[label]] = value
+    return {"fields": new_fields, "link": new_link}
+
+
 def confirm_kb(uid: int):
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(text="✅ Готово, записать", callback_data=f"apt_done_{uid}"),
+            ],
+            [
+                InlineKeyboardButton(text="✏️ Исправить", callback_data=f"apt_edit_{uid}"),
                 InlineKeyboardButton(text="❌ Отмена", callback_data=f"apt_drop_{uid}"),
-            ]
+            ],
         ]
     )
 
@@ -241,6 +278,9 @@ def confirm_kb(uid: int):
 # Одна сессия = одна квартира. Все скрины и ссылка, присланные подряд этим пользователем,
 # копятся в одну сессию, пока он не нажмёт "Готово" или "Отмена".
 sessions: dict[int, dict] = {}
+
+# awaiting_edit — кто сейчас прислал "Исправить" и должен прислать поправленный текст следующим сообщением.
+awaiting_edit: set[int] = set()
 
 
 def get_session(uid: int) -> dict:
@@ -300,8 +340,29 @@ async def apt_drop(cb: CallbackQuery):
         await cb.answer("Это не твоя карточка", show_alert=True)
         return
     sessions.pop(uid, None)
+    awaiting_edit.discard(uid)
     await cb.message.edit_text("Отменено. Можешь начать новую квартиру — пришли скрин.")
     await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("apt_edit_"))
+async def apt_edit(cb: CallbackQuery):
+    uid = int(cb.data[len("apt_edit_"):])
+    if cb.from_user.id != uid:
+        await cb.answer("Это не твоя карточка", show_alert=True)
+        return
+
+    session = sessions.get(uid)
+    if not session:
+        await cb.answer("Нет данных для правки, пришли скрин заново", show_alert=True)
+        return
+
+    awaiting_edit.add(uid)
+    await cb.answer()
+    await cb.message.answer(
+        "Скопируй текст ниже, поправь нужные строки и пришли обратно целиком:\n\n"
+        + format_session_plain(session)
+    )
 
 
 @dp.callback_query(F.data.startswith("apt_done_"))
@@ -336,6 +397,7 @@ async def apt_done(cb: CallbackQuery):
         return
 
     sessions.pop(uid, None)
+    awaiting_edit.discard(uid)
     await cb.message.edit_text(
         cb.message.html_text + "\n\n✅ <b>Квартира записана в таблицу одной строкой.</b>"
     )
@@ -347,6 +409,16 @@ async def handle_text(message: Message):
     text = message.text.strip()
 
     if text.startswith("/"):
+        return
+
+    if uid in awaiting_edit:
+        awaiting_edit.discard(uid)
+        parsed = parse_plain_session(text)
+        session = get_session(uid)
+        session["fields"].update(parsed["fields"])
+        if parsed["link"] is not None:
+            session["link"] = parsed["link"]
+        await message.answer(format_session(session), reply_markup=confirm_kb(uid))
         return
 
     if "avito.ru" not in text and "http" not in text:
